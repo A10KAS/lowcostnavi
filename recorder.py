@@ -18,7 +18,7 @@ import signal
 import sys
 
 # 串口配置
-IMU_PORT = '/dev/ttyACM0'
+IMU_PORT = '/dev/ttyUSB3'
 IMU_BAUD_RATE = 9600
 
 PRESSURE_PORTS = {
@@ -63,6 +63,7 @@ class IMUDataPacket:
     angles: Dict[str, float]  # roll, pitch, yaw
     gyro: Dict[str, float]    # gyro_x, gyro_y, gyro_z
     accel: Dict[str, float]   # acc_x, acc_y, acc_z
+    velocity: Dict[str, float]  # vel_x, vel_y, vel_z (由accel积分估计)
     mag: Optional[Dict[str, float]] = None
 
 @dataclass
@@ -76,10 +77,20 @@ class PressureDataPacket:
 
 @dataclass
 class SyncedDataPacket:
-    """同步后的完整数据包（仅xy平面转动，只保留yaw和z轴角速度）"""
+    """同步后的完整数据包（用于终端展示与txt记录）"""
     timestamp: float
-    yaw: float  # 偏航角（度）
-    gyro_z: float  # Z轴角速度（度/秒）
+    # 线速度（m/s），由 IMU 的加速度积分估计
+    vel_x: float
+    vel_y: float
+    vel_z: float
+    # 线加速度（m/s^2）
+    acc_x: float
+    acc_y: float
+    acc_z: float
+    # 角速度（度/秒）
+    gyro_x: float
+    gyro_y: float
+    gyro_z: float
     pressure_front: float
     pressure_left: float
     pressure_right: float
@@ -308,6 +319,9 @@ def read_imu_serial():
         
         parser = JY901S_Parser()
         latest_data = {}
+        # 速度由加速度积分得到；初始速度为0。
+        velocity = {'vel_x': 0.0, 'vel_y': 0.0, 'vel_z': 0.0}
+        last_ts: Optional[float] = None
         
         while True:
             if ser.in_waiting > 0:
@@ -328,6 +342,30 @@ def read_imu_serial():
                             gyro = latest_data['角速度']
                             accel = latest_data.get('加速度', {})
                             mag = latest_data.get('磁场', None)
+
+                            # 根据加速度与时间间隔积分估计速度（简单积分，存在漂移）
+                            dt = 0.0
+                            if last_ts is not None:
+                                dt = timestamp - last_ts
+
+                            if last_ts is None:
+                                # 首包：不积分，只更新last_ts
+                                pass
+                            elif dt <= 0:
+                                # 异常时间：不积分
+                                pass
+                            elif dt > 1.0:
+                                # dt过大通常意味着丢包/延迟；为了避免速度爆炸，重置速度
+                                velocity = {'vel_x': 0.0, 'vel_y': 0.0, 'vel_z': 0.0}
+                            else:
+                                ax = accel.get('acc_x', 0.0)
+                                ay = accel.get('acc_y', 0.0)
+                                az = accel.get('acc_z', 0.0)
+                                velocity['vel_x'] += ax * dt
+                                velocity['vel_y'] += ay * dt
+                                velocity['vel_z'] += az * dt
+
+                            last_ts = timestamp
                             
                             packet = IMUDataPacket(
                                 timestamp=timestamp,
@@ -345,6 +383,11 @@ def read_imu_serial():
                                     'acc_x': accel.get('acc_x', 0),
                                     'acc_y': accel.get('acc_y', 0),
                                     'acc_z': accel.get('acc_z', 0)
+                                },
+                                velocity={
+                                    'vel_x': velocity['vel_x'],
+                                    'vel_y': velocity['vel_y'],
+                                    'vel_z': velocity['vel_z']
                                 },
                                 mag=mag
                             )
@@ -474,11 +517,11 @@ def read_pressure_serial(port_name, serial_port):
             ser.close()
 
 def synchronize_and_display():
-    """同步数据并显示（仅xy平面转动）"""
+    """同步数据并显示（完整IMU：xyz速度/xyz加速度/xyz角速度）"""
     print("=" * 120)
-    print("统一传感器数据监测系统（xy平面转动模式）")
+    print("统一传感器数据监测系统（完整IMU记录）")
     print("=" * 120)
-    print("时间                    Yaw角度               Z轴角速度              一号压力传感器(前)    二号压力传感器(左)    三号压力传感器(右)")
+    print("时间戳-xyz速度-xyz加速度-角速度-三个压力传感器压力")
     print("-" * 120)
     
     imu_buffer = deque(maxlen=10)
@@ -531,27 +574,44 @@ def synchronize_and_display():
             # 如果所有数据都可用，显示并保存
             if len(synced_pressures) == 3:
                 timestamp_str = datetime.fromtimestamp(latest_imu.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                
-                # 只保留Yaw角度
-                yaw = latest_imu.angles['yaw']
-                yaw_str = f"Yaw:{yaw:7.2f}°"
-                
-                # 只保留Z轴角速度
+
+                vel_x = latest_imu.velocity['vel_x']
+                vel_y = latest_imu.velocity['vel_y']
+                vel_z = latest_imu.velocity['vel_z']
+
+                acc_x = latest_imu.accel['acc_x']
+                acc_y = latest_imu.accel['acc_y']
+                acc_z = latest_imu.accel['acc_z']
+
+                gyro_x = latest_imu.gyro['gyro_x']
+                gyro_y = latest_imu.gyro['gyro_y']
                 gyro_z = latest_imu.gyro['gyro_z']
-                gyro_z_str = f"Z:{gyro_z:7.2f}°/s"
-                
-                # 压力传感器数据
+
                 front_pressure = synced_pressures['front'].pressure
                 left_pressure = synced_pressures['left'].pressure
                 right_pressure = synced_pressures['right'].pressure
-                
-                # 格式化输出：时间——Yaw角度——Z轴角速度——一号压力传感器数据（前）——2号压力传感器数据——三号压力传感器数据
-                print(f"{timestamp_str}  {yaw_str:20s}  {gyro_z_str:20s}  {front_pressure:7.2f}mbar  {left_pressure:7.2f}mbar  {right_pressure:7.2f}mbar")
-                
-                # 保存同步后的数据包（只保存yaw和gyro_z）
+
+                # 终端输出格式（按你的字段顺序）
+                # 时间戳-xyz速度-xyz加速度-角速度-三个压力传感器压力
+                print(
+                    f"{timestamp_str}-"
+                    f"{vel_x:.4f},{vel_y:.4f},{vel_z:.4f}-"
+                    f"{acc_x:.4f},{acc_y:.4f},{acc_z:.4f}-"
+                    f"{gyro_x:.4f},{gyro_y:.4f},{gyro_z:.4f}-"
+                    f"{front_pressure:.2f},{left_pressure:.2f},{right_pressure:.2f}mbar"
+                )
+
+                # 保存同步后的数据包（完整IMU：速度/加速度/角速度 + 3个压力）
                 synced_packet = SyncedDataPacket(
                     timestamp=latest_imu.timestamp,
-                    yaw=yaw,
+                    vel_x=vel_x,
+                    vel_y=vel_y,
+                    vel_z=vel_z,
+                    acc_x=acc_x,
+                    acc_y=acc_y,
+                    acc_z=acc_z,
+                    gyro_x=gyro_x,
+                    gyro_y=gyro_y,
                     gyro_z=gyro_z,
                     pressure_front=front_pressure,
                     pressure_left=left_pressure,
@@ -585,26 +645,25 @@ def save_data_to_file(output_file):
                 f.write("=" * 120 + "\n\n")
                 
                 # 写入表头
-                f.write("时间                    Yaw角度               Z轴角速度              一号压力传感器(前)    二号压力传感器(左)    三号压力传感器(右)\n")
+                f.write("时间戳-xyz速度-xyz加速度-角速度-三个压力传感器压力\n")
                 f.write("-" * 120 + "\n")
                 
                 # 写入所有数据包
                 for packet in all_data_packets:
                     timestamp_str = datetime.fromtimestamp(packet.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-                    
-                    # Yaw角度
-                    yaw_str = f"Yaw:{packet.yaw:7.2f}°"
-                    
-                    # Z轴角速度
-                    gyro_z_str = f"Z:{packet.gyro_z:7.2f}°/s"
-                    
-                    # 压力传感器数据
+
                     front_pressure = packet.pressure_front
                     left_pressure = packet.pressure_left
                     right_pressure = packet.pressure_right
-                    
-                    # 写入数据行
-                    f.write(f"{timestamp_str}  {yaw_str:20s}  {gyro_z_str:20s}  {front_pressure:7.2f}mbar  {left_pressure:7.2f}mbar  {right_pressure:7.2f}mbar\n")
+
+                    # 与终端展示保持一致的字段顺序与格式
+                    f.write(
+                        f"{timestamp_str}-"
+                        f"{packet.vel_x:.4f},{packet.vel_y:.4f},{packet.vel_z:.4f}-"
+                        f"{packet.acc_x:.4f},{packet.acc_y:.4f},{packet.acc_z:.4f}-"
+                        f"{packet.gyro_x:.4f},{packet.gyro_y:.4f},{packet.gyro_z:.4f}-"
+                        f"{front_pressure:.2f},{left_pressure:.2f},{right_pressure:.2f}mbar\n"
+                    )
                 
                 # 写入详细数据（包含温度信息）
                 f.write("\n" + "=" * 120 + "\n")
@@ -614,8 +673,15 @@ def save_data_to_file(output_file):
                 for i, packet in enumerate(all_data_packets, 1):
                     timestamp_str = datetime.fromtimestamp(packet.timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
                     f.write(f"\n数据包 #{i} - {timestamp_str}\n")
-                    f.write(f"  Yaw角度: {packet.yaw:.2f}°\n")
-                    f.write(f"  Z轴角速度: {packet.gyro_z:.2f}°/s\n")
+                    f.write(
+                        f"  速度(m/s): V({packet.vel_x:.4f},{packet.vel_y:.4f},{packet.vel_z:.4f})\n"
+                    )
+                    f.write(
+                        f"  加速度(m/s^2): A({packet.acc_x:.4f},{packet.acc_y:.4f},{packet.acc_z:.4f})\n"
+                    )
+                    f.write(
+                        f"  角速度(°/s): G({packet.gyro_x:.4f},{packet.gyro_y:.4f},{packet.gyro_z:.4f})\n"
+                    )
                     f.write(f"  压力传感器(前): {packet.pressure_front:.2f}mbar, 温度: {packet.pressure_front_temp:.2f}°C\n")
                     f.write(f"  压力传感器(左): {packet.pressure_left:.2f}mbar, 温度: {packet.pressure_left_temp:.2f}°C\n")
                     f.write(f"  压力传感器(右): {packet.pressure_right:.2f}mbar, 温度: {packet.pressure_right_temp:.2f}°C\n")
